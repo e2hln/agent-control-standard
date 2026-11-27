@@ -12,6 +12,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { pathSegments, resolvePath } from "./hookmap-path.ts";
+import { isReservedSegment } from "./reserved-segments.ts";
 
 /**
  * A hookmap value the host sent no field for: the constant this hook always
@@ -30,7 +31,31 @@ export type HookmapLiteral = { literal: string };
  * resolved the same way `outputs.from` is -- against the raw hook payload, at
  * the same seam.
  */
-export type HookmapFieldRead = { from: string };
+export type HookmapFieldRead = { from: string; timeout_when?: HookmapTimeoutSignal };
+
+/**
+ * How one host says it cut a step off at its own timeout -- declared beside
+ * `exit_status.from`, because each host reports it differently and no shared
+ * rule fits all of them (#466).
+ *
+ * When `from` does not map to `success`, the adapter reads `path` and answers
+ * `timeout` if that value is a string containing `contains`; otherwise the
+ * answer stays `failure`. A step that exited 0 is `success` whatever `path`
+ * holds: the signal can only narrow a failure, never overturn a success.
+ *
+ * `timeout` says the host stopped waiting; it does not say whether the step's
+ * effect already happened. That question is Discussion #128's, not this
+ * field's.
+ */
+export type HookmapTimeoutSignal = {
+  /** JSONPath-lite (`$.foo.bar`) into the raw hook payload. */
+  path: string;
+  /** Substring of the value at `path` that only the host's timeout produces. */
+  contains: string;
+};
+
+/** One tool's own output paths under `HookmapOutputs.by_tool` -- see `outputsFor`. */
+export type HookmapToolOutputs = { from: string; within: string };
 
 /** Where a result-gate hook's output lives in the raw hook payload. */
 export type HookmapOutputs = {
@@ -61,7 +86,36 @@ export type HookmapOutputs = {
    * to say where the copies are; nothing here could infer it.
    */
   mirrors?: string[];
+  /** Output paths for tools whose result has another shape -- see `outputsFor`. */
+  by_tool?: Record<string, HookmapToolOutputs>;
 };
+
+/**
+ * The output paths that apply to this payload: the `by_tool` entry for the
+ * tool `entry.tool_name` resolves to, or the entry's default pair. A listed
+ * tool uses its own `from` and `within` and inherits nothing from the default,
+ * so a path written for Bash's result never applies to another tool's.
+ *
+ * One function, called by both `buildPayload` and governStep's output
+ * location, because the leaf that goes on the wire and the leaf a
+ * replacement is patched back into must be the same one. Two lookups could
+ * disagree, and a replacement projected onto Bash's `stdout` path on a Read
+ * result is a shape Claude Code drops, delivering the original. The tool name
+ * comes from `entry.tool_name`, the same path `buildEnvelope` names the tool
+ * by, never from a second source. A name that does not resolve to a string
+ * gets the default pair; `buildEnvelope` refuses that payload anyway.
+ *
+ * `?? undefined` because a hookmap is YAML: a key written with nothing after
+ * it parses to null, which is a key present and unusable, not a key absent.
+ */
+export function outputsFor(entry: HookmapHookEntry, payload: Record<string, unknown>): HookmapOutputs | undefined {
+  const byTool = entry.outputs?.by_tool;
+  if (!byTool) {
+    return entry.outputs ?? undefined;
+  }
+  const tool = resolvePath(payload, entry.tool_name);
+  return typeof tool === "string" && Object.prototype.hasOwnProperty.call(byTool, tool) ? byTool[tool] : entry.outputs;
+}
 
 /** The members every hook entry carries, whichever payload it builds. */
 type HookmapHookEntryCommon = {
@@ -98,8 +152,8 @@ type HookmapHookEntryCommon = {
    * The tool names this gate governs. Undeclared (`undefined`) means "every
    * tool" -- matching Claude Code's own hookmap, which needs no scoping at
    * all because its settings.json matcher already provides it, for both of
-   * its gates: `^(Bash|WebFetch)$` at the request gate, `^Bash$` at the
-   * result gate.
+   * its gates: `^(Bash|WebFetch|Read)$` at the request gate, `^(Bash|Read)$`
+   * at the result gate.
    *
    * Common to both entry kinds, not just the result-gate shape: scoping
    * which tools a gate governs is orthogonal to which payload shape that
@@ -308,6 +362,14 @@ const ACS_VERSION = "0.1.0";
  * this module names none, and test/invariants.test.ts gates that -- so the
  * check is that the rule is renderable, not that it renders anything in
  * particular.
+ *
+ * It also means the block's paths can be written into one object together.
+ * `renderDecision` throws on a path with an empty or reserved segment, and on
+ * two paths where one is the other or sits under it. It throws only when a
+ * decision for that entry arrives, and the delivery posture answers that
+ * throw. Under `proceed` the decision is dropped and the step runs as though
+ * it had never been made. `assertOutputPathsPlaceable` asks the same question
+ * here, at load time.
  */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -371,6 +433,51 @@ function assertRenderableDecisions(hookmap: Hookmap, path: string): void {
           );
         }
       }
+      assertOutputPathsPlaceable(Object.keys(output), `${path}'s ${named}`);
+    }
+  }
+}
+
+/**
+ * Rejects an `output` block whose paths cannot be written into one object, at
+ * load time. Two things make that so: a path with an empty or reserved
+ * segment, and two paths where one is the other or sits under it. These are
+ * the cases `renderDecision`'s writer throws on, and it throws only when a
+ * decision for the entry arrives. The delivery posture answers that throw, so
+ * under `proceed` the decision is dropped and the step runs unmodified.
+ * Measured: a `modify` entry declaring both `a.b` and `a.b.c` loaded clean,
+ * the `modify` arrived, and the step ran as originally requested.
+ *
+ * Compared by segment, so `a.b` and `a.bc` do not collide. A key written
+ * twice in the YAML is not caught here: the parser keeps the last one before
+ * this function sees the map, so there is nothing left to compare.
+ */
+function assertOutputPathsPlaceable(paths: string[], where: string): void {
+  const split = paths.map((outputPath) => ({ outputPath, segments: outputPath.split(".") }));
+  for (const { outputPath, segments } of split) {
+    for (const segment of segments) {
+      if (segment.length === 0 || isReservedSegment(segment)) {
+        throw new Error(
+          `loadHookmap: ${where} output path ${JSON.stringify(outputPath)} names the segment ` +
+            `${JSON.stringify(segment)}, which addresses no field`,
+        );
+      }
+    }
+  }
+  for (let i = 0; i < split.length; i += 1) {
+    for (let j = i + 1; j < split.length; j += 1) {
+      const first = split[i] as { outputPath: string; segments: string[] };
+      const second = split[j] as { outputPath: string; segments: string[] };
+      const shorter = first.segments.length <= second.segments.length ? first.segments : second.segments;
+      const longer = first.segments.length <= second.segments.length ? second.segments : first.segments;
+      if (shorter.every((segment, index) => segment === longer[index])) {
+        throw new Error(
+          `loadHookmap: ${where} output paths ${JSON.stringify(first.outputPath)} and ` +
+            `${JSON.stringify(second.outputPath)} collide: one is the other or sits under it, so no single ` +
+            `output can hold both. A decision for this entry could not be rendered, and the delivery ` +
+            `posture would answer it`,
+        );
+      }
     }
   }
 }
@@ -402,6 +509,61 @@ function assertMirrorsWellFormed(hookmap: Hookmap, path: string): void {
           `loadHookmap: ${path}'s "hooks.${hookEventName}.outputs.mirrors" entry ${JSON.stringify(mirror)} is ` +
             `not a field inside "outputs.within" ${JSON.stringify(within)} -- a mirror is a further path into ` +
             `the same object the leaf lives in, the same relation "outputs.from" has to it`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Refuses, at load, an `outputs.by_tool` that `outputsFor` could hand to the
+ * gate in a shape the gate cannot use. Each entry is a map of exactly `from`
+ * and `within`, with `from` a field inside `within`, the relation the default
+ * pair has. Anything else in an entry (`mirrors`, a nested `by_tool`, any
+ * other key) is refused rather than ignored: the replacement path reads keys
+ * such as `mirrors` off whatever `outputsFor` returns, so a key written here
+ * would apply at the gate while nothing at load had checked it.
+ */
+function assertByToolWellFormed(hookmap: Hookmap, path: string): void {
+  for (const [hookEventName, entry] of Object.entries(hookmap.hooks ?? {})) {
+    const outputs = isPlainObject(entry) ? (entry as { outputs?: unknown }).outputs : undefined;
+    if (!isPlainObject(outputs)) {
+      continue;
+    }
+    const byTool = outputs.by_tool ?? undefined;
+    if (byTool === undefined) {
+      continue;
+    }
+    const at = `"hooks.${hookEventName}.outputs.by_tool"`;
+    if (!isPlainObject(byTool)) {
+      throw new Error(`loadHookmap: ${path}'s ${at} is ${JSON.stringify(byTool)} -- it must map tool names to paths`);
+    }
+    for (const [tool, toolOutputs] of Object.entries(byTool)) {
+      const toolAt = `"hooks.${hookEventName}.outputs.by_tool.${tool}"`;
+      if (!isPlainObject(toolOutputs)) {
+        throw new Error(
+          `loadHookmap: ${path}'s ${toolAt} is ${JSON.stringify(toolOutputs)} -- it must be a map of "from" and "within"`,
+        );
+      }
+      const extra = Object.keys(toolOutputs).filter((key) => key !== "from" && key !== "within");
+      if (extra.length > 0) {
+        throw new Error(
+          `loadHookmap: ${path}'s ${toolAt} declares ${JSON.stringify(extra)} -- an entry holds only "from" and ` +
+            `"within", and inherits nothing from the default`,
+        );
+      }
+      const { from, within } = toolOutputs;
+      const inside =
+        typeof from === "string" &&
+        typeof within === "string" &&
+        within.length > 0 &&
+        from.startsWith(`${within}.`) &&
+        from.length > within.length + 1;
+      if (!inside) {
+        throw new Error(
+          `loadHookmap: ${path}'s "hooks.${hookEventName}.outputs.by_tool.${tool}.from" ${JSON.stringify(from)} ` +
+            `is not a field inside its own "within" ${JSON.stringify(within)} -- the leaf a replacement is ` +
+            `patched into must sit inside the object that is cloned`,
         );
       }
     }
@@ -556,6 +718,50 @@ function assertExitStatusNotBothForms(hookmap: Hookmap, path: string): void {
 }
 
 /**
+ * Rejects a malformed `exit_status.timeout_when`, at load time, for the same
+ * reason `assertExitStatusNotBothForms` does: a shape visible from the hookmap
+ * alone, which a throw at `buildEnvelope` time would hand to the negotiated
+ * posture instead of refusing.
+ *
+ * `timeout_when` refines a field read, so it is refused beside a `literal`
+ * (a literal has no failure for it to narrow). When present it is exactly
+ * `{path, contains}`: `path` a usable JSONPath-lite string, `contains` a
+ * non-empty string. An unknown key is refused rather than ignored, so a typo
+ * (`contain:`) cannot silently switch the detection off.
+ */
+function assertExitStatusTimeoutWellFormed(hookmap: Hookmap, path: string): void {
+  for (const [hookEventName, entry] of Object.entries(hookmap.hooks ?? {})) {
+    const exitStatus = isPlainObject(entry) ? (entry as { exit_status?: unknown }).exit_status : undefined;
+    if (!isPlainObject(exitStatus) || !("timeout_when" in exitStatus)) {
+      continue;
+    }
+    const where = `${path}'s "hooks.${hookEventName}.exit_status.timeout_when"`;
+    if (typeof exitStatus.from !== "string" || exitStatus.from.length === 0) {
+      throw new Error(`loadHookmap: ${where} is declared without "exit_status.from" -- it refines a field read only`);
+    }
+    const signal = exitStatus.timeout_when;
+    if (!isPlainObject(signal)) {
+      throw new Error(`loadHookmap: ${where} must be {path, contains}`);
+    }
+    const unknown = Object.keys(signal).filter((key) => key !== "path" && key !== "contains");
+    if (unknown.length > 0) {
+      throw new Error(`loadHookmap: ${where} declares unknown key(s) ${unknown.map((k) => JSON.stringify(k)).join(", ")} -- it is exactly {path, contains}`);
+    }
+    if (typeof signal.path !== "string" || !signal.path.startsWith("$.") || signal.path.length <= 2) {
+      throw new Error(`loadHookmap: ${where}.path is ${JSON.stringify(signal.path)} -- it must be one JSONPath-lite string such as "$.result.metadata.output"`);
+    }
+    try {
+      pathSegments(signal.path);
+    } catch (failure) {
+      throw new Error(`loadHookmap: ${where}.path is not a usable path: ${failure instanceof Error ? failure.message : String(failure)}`);
+    }
+    if (typeof signal.contains !== "string" || signal.contains.length === 0) {
+      throw new Error(`loadHookmap: ${where}.contains must be a non-empty string`);
+    }
+  }
+}
+
+/**
  * Rejects a hookmap entry that declares `arguments` (a request-gate shape)
  * and also declares `outputs` (a result gate's own output/mirror
  * declaration), at load time.
@@ -647,12 +853,16 @@ function normalizeTools(hookmap: Hookmap): Hookmap {
 
 /** Loads and parses a hookmap YAML file (e.g. claude-code.hookmap.yaml).
  * Throws if any hook's `decisions` block is absent or missing `allow` or
- * `deny`, or if any declared entry is not a renderable rule -- see
+ * `deny`, or if any declared entry is not a renderable rule, including one
+ * whose output paths cannot be written together -- see
  * assertRenderableDecisions. Also throws if any entry's `outputs.mirrors` is
  * malformed or names a field outside `outputs.within` -- see
- * assertMirrorsWellFormed. Also throws if any entry's `tools` is malformed --
+ * assertMirrorsWellFormed. Also throws if any entry's `outputs.by_tool` holds
+ * anything but `from` and `within`, or a `from` outside its own `within` --
+ * see assertByToolWellFormed. Also throws if any entry's `tools` is malformed --
  * see assertToolsWellFormed. Also throws if any entry's `exit_status`
- * declares both `literal` and `from` -- see assertExitStatusNotBothForms.
+ * declares both `literal` and `from` -- see assertExitStatusNotBothForms --
+ * or a malformed `timeout_when` -- see assertExitStatusTimeoutWellFormed.
  * Also throws if a request-gate entry (one declaring `arguments`) also
  * declares `outputs` -- see assertRequestGateDeclaresNoOutputs.
  *
@@ -664,8 +874,10 @@ export function loadHookmap(path: string): Hookmap {
   const hookmap = Bun.YAML.parse(readFileSync(path, "utf8")) as Hookmap;
   assertRenderableDecisions(hookmap, path);
   assertMirrorsWellFormed(hookmap, path);
+  assertByToolWellFormed(hookmap, path);
   assertToolsWellFormed(hookmap, path);
   assertExitStatusNotBothForms(hookmap, path);
+  assertExitStatusTimeoutWellFormed(hookmap, path);
   assertRequestGateDeclaresNoOutputs(hookmap, path);
   assertPairingPathWellFormed(hookmap, path);
   return normalizeTools(hookmap);
@@ -742,8 +954,10 @@ export function modificationDocumentOf(envelope: AcsRequestEnvelope): Record<str
 }
 
 /**
- * `success` / `failure`, per ACS's own enum -- from whichever form this
- * hook's `exit_status` declares.
+ * `success` / `failure` / `timeout`, per ACS's own enum -- from whichever form
+ * this hook's `exit_status` declares. `timeout` is reachable only through a
+ * field read's `timeout_when` (see HookmapTimeoutSignal); `blocked` is not
+ * produced here.
  *
  * A host that reports a numeric exit code is mapped here, in the adapter,
  * rather than in the hookmap: the hookmap is data, and "0 means success" is a
@@ -783,7 +997,20 @@ function exitStatusOf(event: string, rawExitStatus: unknown, payload: Record<str
           `no value in this payload, so this gate cannot say whether the step succeeded`,
       );
     }
-    return raw === 0 || raw === "0" || raw === "success" ? "success" : "failure";
+    if (raw === 0 || raw === "0" || raw === "success") {
+      return "success";
+    }
+    // A failure the host attributes to its own timeout is reported as one.
+    // An unresolved or non-string signal path is not a fault: the signal is
+    // evidence of a timeout, and its absence just leaves the step a failure.
+    const signal = (rawExitStatus as { timeout_when?: HookmapTimeoutSignal }).timeout_when;
+    if (signal !== undefined) {
+      const evidence = resolvePath(payload, signal.path);
+      if (typeof evidence === "string" && evidence.includes(signal.contains)) {
+        return "timeout";
+      }
+    }
+    return "failure";
   }
 
   throw new Error(
@@ -818,7 +1045,7 @@ function buildPayload(
   // `?? undefined` because a hookmap is YAML: a key written with nothing after
   // it parses to null, which is a key present and unusable, not a key absent.
   const argumentsPath = entry.arguments ?? undefined;
-  const outputs = entry.outputs ?? undefined;
+  const outputs = outputsFor(entry, payload);
 
   if (argumentsPath !== undefined && outputs !== undefined) {
     throw new Error(
