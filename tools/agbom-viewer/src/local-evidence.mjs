@@ -139,8 +139,15 @@ export function modelEntries(bom) {
     return items(entries).flatMap((entry, i) => visitEntry(entry, [...prefix, i]));
   }
 
+  const subject = bom.metadata?.component;
+  const subjectPath = ['metadata', 'component'];
+  const subjectRef = subject?.['bom-ref'];
+  const duplicateSubject = subject?.type === 'machine-learning-model' &&
+    typeof subjectRef === 'string' && subjectRef !== '' &&
+    items(bom.components).some((entry) => entry?.type === 'machine-learning-model' && entry['bom-ref'] === subjectRef);
+
   return [
-    ...visitEntry(bom.metadata?.component, ['metadata', 'component']),
+    ...(duplicateSubject ? visit(subject.components, [...subjectPath, 'components']) : visitEntry(subject, subjectPath)),
     ...visit(bom.components, ['components']),
     ...items(bom.inventories).flatMap((inventory, i) => visit(inventory?.components, ['inventories', i, 'components'])),
   ];

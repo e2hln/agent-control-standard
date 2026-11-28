@@ -246,6 +246,70 @@ test('metadata model evidence matches hexadecimal revisions and preserves case-s
   }).status, 'Mismatch');
 });
 
+const repeatedModelAibom = {
+  bomFormat: 'CycloneDX',
+  specVersion: '1.6',
+  metadata: {
+    component: { type: 'machine-learning-model', name: 'M', 'bom-ref': 'pkg:huggingface/Org/M@abc1234', version: 'abc1234' },
+  },
+  components: [
+    { type: 'machine-learning-model', name: 'M', 'bom-ref': 'pkg:huggingface/Org/M@abc1234', version: 'abc1234' },
+  ],
+};
+const recordedModel = { name: 'Org/M', version: 'abc1234' };
+const modelAssociation = { aibom: 'model.aibom.json' };
+
+test('a model resolves from either AIBOM location on its own', () => {
+  const { metadata, components, ...header } = repeatedModelAibom;
+  for (const [aibom, entry, path] of [
+    [{ ...header, components }, components[0], ['components', 0]],
+    [{ ...header, metadata }, metadata.component, ['metadata', 'component']],
+  ]) {
+    assert.deepEqual(modelEntries(aibom), [{ entry, path }]);
+    const result = inspectModelIdentity(recordedModel, { record: modelAssociation, aibom });
+    assert.equal(result.status, 'Matching recorded identifier and revision');
+    assert.strictEqual(result.entry, entry);
+    assert.deepEqual(result.path, path);
+  }
+});
+
+test('a repeated AIBOM model contributes one candidate from components', () => {
+  const entries = modelEntries(repeatedModelAibom);
+  assert.equal(entries.length, 1);
+  assert.strictEqual(entries[0].entry, repeatedModelAibom.components[0]);
+  assert.deepEqual(entries[0].path, ['components', 0]);
+});
+
+for (const aibomComponentRef of [undefined, repeatedModelAibom.components[0]['bom-ref']]) {
+  test(`the repeated AIBOM model resolves ${aibomComponentRef ? 'with' : 'without'} aibomComponentRef`, () => {
+    const record = aibomComponentRef ? { ...modelAssociation, aibomComponentRef } : modelAssociation;
+    const result = inspectModelIdentity(recordedModel, { record, aibom: repeatedModelAibom });
+    assert.equal(result.status, 'Matching recorded identifier and revision', result.detail);
+    assert.strictEqual(result.entry, repeatedModelAibom.components[0]);
+    assert.deepEqual(result.path, ['components', 0]);
+  });
+}
+
+test('models with different, missing or empty BOM references remain distinct', () => {
+  const original = repeatedModelAibom.components[0];
+  for (const [subjectRef, componentRef] of [
+    ['pkg:huggingface/Org/Other@abc1234', original['bom-ref']],
+    [undefined, undefined],
+    ['', ''],
+  ]) {
+    const subject = { ...original, 'bom-ref': subjectRef };
+    const component = { ...original, 'bom-ref': componentRef };
+    const aibom = { ...repeatedModelAibom, metadata: { component: subject }, components: [component] };
+    assert.deepEqual(modelEntries(aibom), [
+      { entry: subject, path: ['metadata', 'component'] },
+      { entry: component, path: ['components', 0] },
+    ]);
+    assert.deepEqual(inspectModelIdentity(recordedModel, { record: modelAssociation, aibom }), {
+      status: 'Insufficient evidence', detail: 'Multiple machine-learning-model entries match.',
+    });
+  }
+});
+
 test('BOM references fold only the hexadecimal UUID', () => {
   const uuid = 'abcdef01-2345-6789-abcd-ef0123456789';
   const document = 'urn:cdx:' + uuid + '/1';
